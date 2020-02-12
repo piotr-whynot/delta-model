@@ -77,7 +77,7 @@ $(document).on('click','.showhideDiv', function(event){
 
 
 $(document).on('change','#inputFileSelector', function(event){
-    $("#input_outcome").html('<img src="./img/ajax-loader.gif" alt="Uploading...." class=centered>');
+    $("#input_outcome").html('<img src="./static/img/ajax-loader.gif" alt="Uploading...." class=centered>');
     form=$("#input_form")[0];
     formdata=new FormData(form);
     $.ajax({
@@ -166,7 +166,7 @@ $(document).on('change','#inputFileSelector', function(event){
 
 
 $(document).on('change','#paramFileSelector', function(event){
-    $("#param_outcome").html('<img src="./img/ajax-loader.gif" alt="Uploading...." class=centered>');
+    $("#param_outcome").html('<img src="./static/img/ajax-loader.gif" alt="Uploading...." class=centered>');
     form=$("#param_form")[0];
     formdata=new FormData(form);
     $.ajax({
@@ -203,7 +203,7 @@ $(document).on('change','#paramFileSelector', function(event){
 
 
 $(document).on('change','#initcondFileSelector', function(event){
-    $("#initcond_outcome").html('<img src="./img/ajax-loader.gif" alt="Uploading...."/>');
+    $("#initcond_outcome").html('<img src="./static/img/ajax-loader.gif" alt="Processing...."/>');
     form=$("#initcond_form")[0];
     formdata=new FormData(form);
     $.ajax({
@@ -288,7 +288,7 @@ $(document).on('click','#run_model', function(event){
     form=$("#run_form")[0];
     formdata=new FormData(form);
     console.log(formdata);
-    $("#run_outcome").html('<img src="./img/ajax-loader.gif" alt="Uploading...." class=centered>');
+    $("#run_outcome").html('<img src="./img/ajax-loader.gif" alt="Calculating...." class=centered>');
     $.ajax({
         url: "runmodel.php",
         method: "POST",
