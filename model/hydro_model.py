@@ -1,10 +1,14 @@
 import sys
 import numpy as np
 import datetime
-sys.path.append('./config/')
-import gl
 import pandas as pd
-from netCDF4 import Dataset
+#from pandas.plotting import register_matplotlib_converters
+#register_matplotlib_converters()
+#from netCDF4 import Dataset
+#import timeit
+#from matplotlib import pyplot as plt
+import pyximport; pyximport.install()
+import hydro_model_cython as hcy
 
 #*****************************************************************************
 #definition of paramater and input files 
@@ -32,702 +36,307 @@ for i in range(5,len(sys.argv)):
 #*****************************************************************************
 # functions
 
-
 def read_modset(file_modset):
+    global glconvcrit, glmaxiter, glnofswcells, glnofgwcells, glnofoutlets, glnoflinks, gldowncell, gloutputflag, glfinalsumflag, glswcellname
     print("reading model setup from "+file_modset+"...")
     with open(file_modset, "r") as fmodset:
         #convergence criterion
-        gl.convcrit=float(fmodset.readline().strip().split(",")[1])
+        glconvcrit=float(fmodset.readline().strip().split(",")[1])
         #maxiterations
-        gl.maxiter=int(fmodset.readline().strip().split(",")[1])
+        glmaxiter=int(fmodset.readline().strip().split(",")[1])
         
         # numbers of cells are read
-        gl.nofswcells=int(fmodset.readline().strip().split(",")[1])
-        gl.nofgwcells=int(fmodset.readline().strip().split(",")[1])
-        gl.nofoutlets=int(fmodset.readline().strip().split(",")[1])
+        glnofswcells=int(fmodset.readline().strip().split(",")[1])
+        glnofgwcells=int(fmodset.readline().strip().split(",")[1])
+        glnofoutlets=int(fmodset.readline().strip().split(",")[1])
         # links between reservoirs are read
-        gl.noflinks=[]
-        gl.downcell=[]
-        for scell in range(gl.nofswcells):
+        glnoflinks=[]
+        gldowncell=[]
+        for scell in range(glnofswcells):
             nlinks=int(fmodset.readline().strip().split(",")[1])
-            gl.noflinks.append(nlinks)
+            glnoflinks.append(nlinks)
             temp=[]
             if nlinks>0:
                 for link in range(nlinks):
                     temp.append(int(fmodset.readline().strip().split(",")[1]))
-            gl.downcell.append(temp)
+            gldowncell.append(temp)
         # ouput flag for cells
-        gl.outputflag=[]
-        for scell in range(gl.nofswcells):
-            gl.outputflag.append(int(fmodset.readline().strip().split(",")[1]))
+        gloutputflag=[]
+        for scell in range(glnofswcells):
+            gloutputflag.append(int(fmodset.readline().strip().split(",")[1]))
 
         # final sum flag
-        gl.finalsumflag=[]
-        for scell in range(gl.nofswcells):
-            gl.finalsumflag.append(int(fmodset.readline().strip().split(",")[1]))
+        glfinalsumflag=[]
+        for scell in range(glnofswcells):
+            glfinalsumflag.append(int(fmodset.readline().strip().split(",")[1]))
 
-        gl.swcellname=[]
-        for scell in range(gl.nofswcells):
+        glswcellname=[]
+        for scell in range(glnofswcells):
             cellname=fmodset.readline().strip().split(",")[1]
             #print(scell,cellname)
-            gl.swcellname.append(cellname)
+            glswcellname.append(cellname)
+        glfinalsumflag=np.array(glfinalsumflag)
     print("done")
 
-
-
-
 #*****************************************************************************
+   
+
+ 
 def read_input(file_input):
+    global glrecdate, glinflow, glprec, glpet, gltminmax, glnoftsteps,glstatratio
+
     print ("reading input data from: "+file_input)
-    gl.recdate=[]
-    gl.sq_in0=[]
-    gl.p1=[]
-    gl.p2=[]
-    gl.evap=[]
-    gl.tminmax=[]
-    with open(file_input, "r") as finput:
-        fdata=finput.readlines()[1:]  
-    test=fdata[0].strip().split(",")
-    if len(test)==5:
-        #evaporation
-        for aline in fdata:
-            temp=aline.strip().split(",")
-            gl.recdate.append(temp[0])
-            gl.sq_in0.append(float(temp[1]))
-            gl.p1.append([float(temp[2]),float(temp[3])])
-            gl.evap.append(float(temp[4]))
-        gl.noftsteps=len(gl.recdate)
+    inputData=pd.read_csv(file_input, index_col=0, parse_dates=True)
+    
+    glrecdate=inputData.index.strftime("%Y-%m-%d")
+    glinflow=inputData['Inflow-Mohembo'].values
+    prec=inputData[['Rainfall-Maun', 'Rainfall-Shakawe']].values
+    if inputData.shape[1]==4:
+        glpet=inputData['PET-Maun'].values
     else:
-        #temperatures 
-        for aline in fdata:
-            temp=aline.strip().split(",")
-            gl.recdate.append(temp[0])
-            gl.sq_in0.append(float(temp[1]))
-            gl.p1.append([float(temp[2]),float(temp[3])])
-            gl.tminmax.append([float(temp[4]),float(temp[5])])
-        gl.noftsteps=len(gl.recdate)
+        gltmin=inputData['MinTemperature-Maun'].values
+        gltmax=inputData['MaxTemperature-Maun'].values
         evap_calc()
-    print (str(gl.noftsteps) + " time steps read")
+    glnoftsteps=inputData.shape[0]
+    
+    #calculating unit rainfall
+    ratios=np.tile(np.array(glstatratio).reshape(-1,1),glnoftsteps).T
+    glprec=prec[:,0].reshape(-1,1)*ratios+prec[:,1].reshape(-1,1)*(1-ratios)
+
+    print (str(glnoftsteps) + " time steps read")
+
 
 
 #*****************************************************************************
 def read_init(file_init):
+    global glsv_init, glfv_init, gliv_init, glnofswcells, glnofgwcells
+    
     print ("reading initial condition from: "+file_init)
     with open(file_init, "r") as finit:
-
+        data=finit.readlines()
         # initial storage of surface cells
-        gl.sv_start=[]
-        for scell in range(gl.nofswcells):
-            gl.sv_start.append(float(finit.readline().strip().split(",")[1]))
-
-        #initial storage of groundwater cells
-        gl.fv_start=[]
-        gl.iv_start=[]
-        for scell in range(gl.nofswcells):
-            temp=finit.readline().strip().split(",")
-
-            gl.fv_start.append([float(temp[1])]*gl.nofgwcells)
-            gl.iv_start.append([float(temp[2])]*gl.nofgwcells)
-
-    gl.iv_start=np.array(gl.iv_start)
-    gl.fv_start=np.array(gl.fv_start)
+    temp=data[0:glnofswcells]
+    temp=np.array([x.strip().split(",") for x in temp])
+    glsv_init=temp[:,1].astype(float)
+        
+    #initial storage of groundwater cells
+    temp=data[glnofswcells:(glnofswcells*2)]
+    temp=np.array([x.strip().split(",") for x in temp])
+    print temp.shape
+    glfv_init=temp[:,1:].astype(float)
+    
+    temp=data[(glnofswcells*2):(glnofswcells*3)]
+    temp=np.array([x.strip().split(",") for x in temp])
+    print temp.shape
+    gliv_init=temp[:,1:].astype(float)
+    
     print("done")
-
-
-
-
 
 
 #*****************************************************************************
 def read_modpar(file_modpar):
+    global glgwpar, glunitpar, glexponent, glbpar, glk, glV, gldelay,glstatratio,glfa, glia,glkgw,glfa_total,glnofgwcells,glnofswcells, glnoflinks
     print ("reading model parameters from: "+file_modpar)
     with open(file_modpar, "r") as fmodpar:
         # spatially constant parameters
-        gl.fdet=float(fmodpar.readline().strip().split(",")[1])
-        gl.idet=float(fmodpar.readline().strip().split(",")[1])
-        gl.fpor=float(fmodpar.readline().strip().split(",")[1])
-        gl.ipor=float(fmodpar.readline().strip().split(",")[1])
+        fdet=float(fmodpar.readline().strip().split(",")[1])
+        idet=float(fmodpar.readline().strip().split(",")[1])
+        fpor=float(fmodpar.readline().strip().split(",")[1])
+        ipor=float(fmodpar.readline().strip().split(",")[1])
     
         # volume-area parameters
-        gl.bpar=[]
-        gl.exponent=[]
-        for scell in range(gl.nofswcells):
+        glbpar=[]
+        glexponent=[]
+        for scell in range(glnofswcells):
             temp=fmodpar.readline().strip().split(",")
-            gl.exponent.append(float(temp[1]))
-            gl.bpar.append(float(temp[2]))
+            glexponent.append(float(temp[1]))
+            glbpar.append(float(temp[2]))
 
         # outlet parameters
-        gl.k=[]
-        gl.V=[]
-        for scell in range(gl.nofswcells):
+        glk=[]
+        glV=[]
+        for scell in range(glnofswcells):
             temp2=[]
             temp3=[]
-            if gl.noflinks[scell] > 0:
-                for link in range(gl.noflinks[scell]):
+            if glnoflinks[scell] > 0:
+                for link in range(glnoflinks[scell]):
                     temp=fmodpar.readline().strip().split(",")
                     temp2.append(float(temp[1]))
                     temp3.append(float(temp[2]))                
-            gl.k.append(temp2)
-            gl.V.append(temp3)
+            glk.append(temp2)
+            glV.append(temp3)
             
 
         # delay parameter for units
-        gl.delay=[]
-        for scell in range(gl.nofswcells):
-            gl.delay.append(int(fmodpar.readline().strip().split(",")[1]))
+        gldelay=[]
+        for scell in range(glnofswcells):
+            gldelay.append(int(fmodpar.readline().strip().split(",")[1]))
 
         # maun/shakawe rainfall ratio parameters
-        gl.statratio=[]
-        for scell in range(gl.nofswcells):
-            gl.statratio.append(float(fmodpar.readline().strip().split(",")[1]))
+        glstatratio=[]
+        for scell in range(glnofswcells):
+            glstatratio.append(float(fmodpar.readline().strip().split(",")[1]))
 
         # groundwater reservoir areas and "transmissivity"
-        gl.fa=[]
-        gl.ia=[]
-        gl.kgw=[]
-        gl.fa_max=[]
-        for scell in range(gl.nofswcells):
+        glfa=[]
+        glia=[]
+        glkgw=[]
+        glfa_total=[]
+        for scell in range(glnofswcells):
             temp=fmodpar.readline().strip().split(",")
-            gl.fa.append(float(temp[1]))
-            gl.ia.append(float(temp[2]))
-            gl.kgw.append(float(temp[3]))
-            gl.fa_max.append(float(temp[1])*gl.nofgwcells)
+            glfa.append(float(temp[1]))
+            glia.append(float(temp[2]))
+            glkgw.append(float(temp[3]))
+            glfa_total.append(float(temp[1])*glnofgwcells)
+            
+            
+    outletpar=np.zeros([16,30])
+    for i,k in enumerate(glk):
+        for ii,kk in enumerate(k):
+            outletpar[i,ii]=kk
+    for i,v in enumerate(glV):
+        for ii,vv in enumerate(v):
+            outletpar[i,ii+10]=vv
+    for i,c in enumerate(gldowncell):
+        for ii,cc in enumerate(c):
+            outletpar[i,ii+20]=cc
+
+    glunitpar=np.array(gldelay).reshape(-1,1)
+    glunitpar=np.append(glunitpar, np.array(glstatratio).reshape(-1,1), axis=1)
+    glunitpar=np.append(glunitpar, np.array(glbpar).reshape(-1,1), axis=1)
+    glunitpar=np.append(glunitpar, np.array(glexponent).reshape(-1,1), axis=1)
+    glunitpar=np.append(glunitpar, np.array(glfa).reshape(-1,1), axis=1)
+    glunitpar=np.append(glunitpar, np.array(glia).reshape(-1,1), axis=1)
+    glunitpar=np.append(glunitpar, np.array(glkgw).reshape(-1,1), axis=1)
+    glunitpar=np.append(glunitpar, outletpar, axis=1)
+
+    glgwpar=np.array([fdet,fpor,idet,ipor])
+    print ("done")
+
+    
+    
+#*****************************************************************************
+def evap_calc():
+    global glnoftsteps, glrecdate, gltminmax, glpet   
+    r0 = [16.35261505, 14.95509782, 12.8087226, 10.86376736, 9.847079426, 10.22676382, 11.84785549, 14.00041471, 15.76601788, 16.82545576, 17.20206337, 17.09344496]
+    kc= [0.95, 0.9, 0.8, 0.7, 0.63, 0.6, 0.6, 0.63, 0.7, 0.8, 0.9, 0.95]
+    glpet=[]
+    for ts in range(glnoftsteps):
+        curmonth=datetime.datetime.strptime(glrecdate[ts], "%b-%Y").month
+        temp= 31 * kc[curmonth-1] * 0.0023 * r0[curmonth-1] * (gltminmax[ts][1] - gltminmax[ts][0]) ** 0.5 * (((gltminmax[ts][1] + gltminmax[ts][0]) / 2) + 17.8)
+        glpet.append(temp)
+    glpet=np.array(glpet)
+    print ("calculated evap...")
+    
+
+def write_output_cellinundation(file_output):
+    global glout_sa
+    print ("writing surface area output file...")
+    glout_sa.astype(int).to_csv(file_output)
+    print ("done")
+
+def write_output_totalinundation(file_output):
+    global glout_sa
+    print ("writing surface area output file...")
+    glout_sa.sum(0).astype(int).to_csv(file_output)
     print ("done")
 
 
+def write_output_cellvolume(file_output):
+    global glout_sv
+    print ("writing surface volume output file...")
+    glout_sv.astype(int).to_csv(file_output)
+    print ("done")
 
-
-
-#*****************************************************************************
-def evap_calc():
-    r0 = [16.35261505, 14.95509782, 12.8087226, 10.86376736, 9.847079426, 10.22676382, 11.84785549, 14.00041471, 15.76601788, 16.82545576, 17.20206337, 17.09344496]
-    kc= [0.95, 0.9, 0.8, 0.7, 0.63, 0.6, 0.6, 0.63, 0.7, 0.8, 0.9, 0.95]
-    gl.evap=[]
-    for ts in range(gl.noftsteps):
-        curmonth=datetime.datetime.strptime(gl.recdate[ts], "%b-%Y").month
-        temp= 31 * kc[curmonth-1] * 0.0023 * r0[curmonth-1] * (gl.tminmax[ts][1] - gl.tminmax[ts][0]) ** 0.5 * (((gl.tminmax[ts][1] + gl.tminmax[ts][0]) / 2) + 17.8)
-        gl.evap.append(temp)
-    print ("calculated evap...")
-    
-    
-    
-
-
-
-
-#***************************************************************************
-def model_calc():
-    print ("running model..")
-    # this is main calculation program
-    #prepare some lists to store data
-    gl.sq_in=np.array([[0]*gl.noftsteps]*gl.nofswcells)
-    gl.sq_in[0,:]=gl.sq_in0
-    gl.sq_out=np.array([[0]*gl.noftsteps]*gl.nofswcells)
-    gl.fin_sa_end=np.array([[0]*gl.noftsteps]*gl.nofswcells)
-    gl.fin_sv_end=np.array([[0]*gl.noftsteps]*gl.nofswcells)
-    gl.fin_iv_end=np.array([[0]*gl.noftsteps]*gl.nofswcells)
-    gl.fin_fv_end=np.array([[0]*gl.noftsteps]*gl.nofswcells)    
-    gl.fin_sev_end=np.array([[0]*gl.noftsteps]*gl.nofswcells)
-    gl.fin_iev_end=np.array([[0]*gl.noftsteps]*gl.nofswcells)
-    gl.fin_fev_end=np.array([[0]*gl.noftsteps]*gl.nofswcells)    
-    gl.sv_end=0
-    gl.fa_frac_start=np.transpose(np.array([[0]*gl.nofswcells]*gl.nofgwcells))
-    gl.fa_frac_avg=[0]*gl.nofgwcells
-    gl.fv_finish=[0]*gl.nofgwcells
-    gl.iv_finish=np.transpose(np.array([[0]*gl.nofswcells]*gl.nofgwcells))
-    gl.fa_frac_finish=np.transpose(np.array([[0]*gl.nofswcells]*gl.nofgwcells))
-    gl.sv_model=0    
-    gl.intcptv_model=0
-    gl.sa_model=0
-    gl.siv_model=0
-    gl.sev_model=0
-    gl.fev_model=0
-    gl.iev_model=0
-    gl.fq_model=0
-    
-    #iterate through time steps
-#    for ts in range(50):
-    for ts in range(gl.noftsteps):
-        if ts%50==0:
-            print ("ts="+str(ts))
-        #iterate through model cells
-        for scell in range(gl.nofswcells):
-            calc_res_iter(ts, scell)
-            #get starting volume for the next time step for this cell
-            gl.sv_start[scell] = gl.sv_end
-            #get inflows to the downstream cells
-            for link in range(gl.noflinks[scell]):
-                cellno=gl.downcell[scell][link]
-                gl.sq_in[cellno][ts] = gl.sq_in[cellno][ts] + gl.sq[link]
-                    
-            if gl.finalsumflag[scell]== 1:
-                get_compositefluxes()
-    print("done")
-
-
-
-#***************************************************************************    
-def get_compositefluxes():
-    a=1
-    gl.sv_model = gl.sv_model + gl.sv_end
-#    gl.intcptv_model = gl.intcptv_model + gl.intcptv
-    gl.sa_model = gl.sa_model + gl.sa_end
-    gl.siv_model = gl.siv_model + gl.siv_unit
-    gl.sev_model = gl.sev_model + gl.sev
-#    gl.fev_model = gl.fev_model + gl.fev_unit
-#    gl.iev_model = gl.iev_model + gl.iev_unit
-#    gl.fq_model = gl.fq_model + gl.fq_unit
+def write_output_cellq(file_output):
+#write discharges for each cell
+    global glout_sqout
+    print ("writing discharge output file...")
+    glout_sqout.astype(int).to_csv(file_output)
+    print ("done")
 
 
 def mergecells(glvar):
     #write areas for each cell
-    selcells=glvar[np.array(gl.outputflag)==1,:]
-    cellnames=np.array(gl.swcellname)
-    tooutput=np.array(gl.outputflag)
+    global gloutputflag, glswcellname, glrecdate
+    selcells=glvar[:,np.array(gloutputflag)==1]
+    cellnames=np.array(glswcellname)
+    tooutput=np.array(gloutputflag)
     selcellnames=cellnames[tooutput==1]
+    selcellnames=['Panhandle','Nqoga','Thaoge','Xudum','Boro','Maunachira','Selinda','Mboroga','Khwai']
     merged=[[0],[1,2],[3],[4],[5],[6,7],[8],[9],[10]]
     outputtable=[]
     outputcellnames=[]
-    for m in merged:
-        outputcellnames=outputcellnames+[selcellnames[m[0]]]
+    for j,m in enumerate(merged):
+        outputcellnames=outputcellnames+[selcellnames[j]]
         current=0
         for i in m:
-            current=current+selcells[i,:]
+            current=current+selcells[:,i]
         outputtable=outputtable+[current]
-    outputtable=np.array(outputtable)
-    outputcellnames=np.array(outputcellnames)
-    return outputcellnames,outputtable
+    outputFrame=pd.DataFrame(np.array(outputtable).T, index=pd.to_datetime(glrecdate), columns=outputcellnames)    
+    return outputFrame
 
 
-
-#***************************************************************************
-def write_output_cellinundation(file_output):
-    print ("writing surface area output file...")
-    cellnames,celldata=mergecells(gl.fin_sa_end)
-    with open(file_output, "w") as foutput:
-#        foutput.write("Inundated surface area [km2]");
-        foutput.write("Date,");
-        for scell in range(len(cellnames)):
-            foutput.write(cellnames[scell]+",");
-        foutput.write("\n");
-        for ts in range(gl.noftsteps):
-            foutput.write(gl.recdate[ts]+",");
-            for scell in range(len(cellnames)):
-                foutput.write(str(int(celldata[scell][ts]))+",");
-            foutput.write("\n");
-    print ("done")
-
-def write_output_totalinundation(file_output):
-    print ("writing surface area output file...")
-    cellnames,celldata=mergecells(gl.fin_sa_end)
-    with open(file_output, "w") as foutput:
-#        foutput.write("Inundated surface area [km2]");
-        foutput.write("Date,");
-        foutput.write("Total inundation,");
-        foutput.write("\n");
-        for ts in range(gl.noftsteps):
-            foutput.write(gl.recdate[ts]+",");
-            foutput.write(str(int(np.sum(celldata,0)[ts]))+",");
-            foutput.write("\n");
-    print ("done")
-
-
-def write_output_cellq(file_output):
-#write discharges for each cell
-    print ("writing discharge output file...")
-    cellnames,celldata=mergecells(gl.sq_out)
-    with open(file_output, "w") as foutput:
-        foutput.write("Inundated surface area [km2]");
-        foutput.write("Date,");
-        for scell in range(len(cellnames)):
-            foutput.write(cellnames[scell]+",");
-        foutput.write("\n");
-        for ts in range(gl.noftsteps):
-            foutput.write(gl.recdate[ts]+",");
-            for scell in range(len(cellnames)):
-                foutput.write(str(int(celldata[scell][ts]))+",");
-            foutput.write("\n");
-    print ("done")
-
-
-
-def write_output_totalecoregions(file_output):
-    print ("writing ecoregions output file...")
-    ecoclasses=["Aquatic","Sedges","Grassland","Savanna"]
-    with open(file_output, "w") as foutput:
-        foutput.write("Year,");
-        for unit in range(4):
-            foutput.write(ecoclasses[unit]+",");
-        foutput.write("\n");
-        nts=len(gl.ecototal[0])
-        for ts in range(0, nts):
-            foutput.write(str(gl.firstyear+ts)+",")
-            for unit in range(4):
-                foutput.write(str(int(gl.ecototal[unit][ts]))+",");
-            foutput.write("\n");
-    print ("output has "+str(nts)+" annual time steps")
-    print("done\n")
-
-
-
-
-
-
-#***************************************************************************    
-
-def calc_res_iter(ts, scell):
-    # this calculates one reservoir
-    # prepare data
-    #reset outlets outflow
-    gl.sq=[0]*gl.nofoutlets
-
-    # read inputs and declare initial STATIC variables
-    sqin = gl.sq_in[scell][max(0, ts - gl.delay[scell])]
-    gl.sv_beg = gl.sv_start[scell]
-    gl.sv_end = gl.sv_beg + 0.5 * sqin
-    s_iter_flag = 0
-    sitern = 0
-    sv_endmin = 0
-    sv_endmax = ""
-    
-    s_iter_flag=0
-    while s_iter_flag<1:
-        sqout = 0
-        sv_av = (gl.sv_end + gl.sv_beg) / 2
-           
-        if scell==0:
-            #Case 1
-            if gl.sv_end < 1500:
-                gl.sa_end = (0.006 * gl.sv_end)**3
-            else:
-                gl.sa_end = (gl.bpar[scell] * gl.sv_end)**gl.exponent[scell]
-        
-            if gl.sv_beg < 1500:
-                gl.sa_beg = (0.006 * gl.sv_beg)**3
-            else:
-                gl.sa_beg = (gl.bpar[scell] * gl.sv_beg)**gl.exponent[scell]
-        
-        elif scell==1 or scell==6 or scell==5 or scell==13 or scell==14:
-            #Case 2, 7, 6, 14, 15
-            gl.sa_end = (gl.bpar[scell] * gl.sv_end)**gl.exponent[scell]
-            if gl.sa_end > gl.fa_max[scell]:
-                gl.sa_end = gl.fa_max[scell]
-        
-            gl.sa_beg = (gl.bpar[scell] * gl.sv_beg)**gl.exponent[scell]
-            if gl.sa_beg > gl.fa_max[scell]:
-                gl.sa_beg = gl.fa_max[scell]
-        
-        else:
-            gl.sa_end = (gl.bpar[scell] * gl.sv_end)**gl.exponent[scell]
-            gl.sa_beg = (gl.bpar[scell] * gl.sv_beg)**gl.exponent[scell]
-
-        
-        sa_av = (gl.sa_beg + gl.sa_end) / 2
-        rain = (gl.statratio[scell] * gl.p1[max(ts - gl.delay[scell],0)][0] + (1 - gl.statratio[scell]) * gl.p1[max(0,ts - gl.delay[scell])][1])
-    
-        spv = rain * sa_av / 1000
-    
-    
-        if ts - gl.delay[scell] == 0:
-            # this is to account for ts-delay evap from sw
-            gl.sev = 0
-        else:
-            gl.sev = gl.evap[ts - gl.delay[scell]] * sa_av / 1000
-            #gl.sev = kc(Month(inp(ts - delay(scell)).recdate)) * inp(ts - delay(scell)).evap * sa_av / 1000
-
-
-
-        #-------------------------------------------------------------------------
-        # calculate surface outflows
-        for n in range(gl.noflinks[scell]):
-            if sv_av > gl.V[scell][n]:
-                gl.sq[n] = gl.k[scell][n] * (sv_av - gl.V[scell][n])
-            else:
-                gl.sq[n] = 0
-                
-        #calculate groundwater outflow
-        calc_gw_iter(scell, ts)
-
-        #calculate surface water outflows
-        for n in range(gl.nofoutlets):
-            sqout = sqout + gl.sq[n]
-        #calculate end water balance
-        sv_endc = gl.sv_beg + spv - gl.sev - sqout + sqin - gl.siv_unit
-#        if(scell==4 and ts%10==0):
-    
-        #-------------------------------------------------------------------------
-        #check if convergence is achieved
-        if abs(sv_endc - gl.sv_end) < gl.convcrit * gl.sv_end:
-            s_iter_flag = 1
-        elif gl.sv_end < 0.001:
-            gl.sv_end = 0
-            s_iter_flag = 1
-        else:
-            if gl.sv_end > sv_endc:
-                sv_endmax = gl.sv_end
-            else:
-                sv_endmin = gl.sv_end
-        
-            if sv_endmax=="":
-                gl.sv_end = sv_endc
-            else:
-                gl.sv_end = sv_endmin + 0.5 * (sv_endmax - sv_endmin)
-        
-        #-------------------------------------------------------------------------
-        #advance iteration
-    
-        sitern = sitern + 1
-        
-        if sitern > gl.maxiter:
-            print (str(gl.maxiter) + " s iterations in cell " + str(scell) + " in " + gl.recdate[ts])
-            s_iter_flag=1
-
-    #preparation for next time step
-    gl.sq_out[scell][ts] = sqout
-
-    gl.fin_sa_end[scell][ts] = gl.sa_end
-    gl.fin_sv_end[scell][ts] = gl.sv_end
-    gl.fin_iv_end[scell][ts] = np.sum(gl.iv_finish[scell])
-    gl.fin_fv_end[scell][ts] = np.sum(gl.fv_finish)
-    gl.fin_sev_end[scell][ts] = gl.sev
-
-    for gwcell in range(gl.nofgwcells):
-        gl.fv_start[scell][gwcell] = gl.fv_finish[gwcell]
-        gl.iv_start[scell][gwcell] = gl.iv_finish[scell][gwcell]
-        gl.fa_frac_start[scell][gwcell] = gl.fa_frac_finish[scell][gwcell]
-
-
-
-
-#*****************************************************************************
-def calc_gw_iter(scell, ts):
-    # this calculates a coupled groundwater reservoir
-    # prepare data
-    #-----------------------------------------------------------------------------
-    #get initial values of variables
-    fa_cum = 0
-    gl.siv = 0
-    gl.siv_unit = 0
-    fev_sum = 0
-    iev_sum = 0
-    fv_sum = 0
-    iv_sum = 0
-    fq_sum = 0
-
-    fpv_sum = 0
-    ipv_sum = 0
-    gl.fpv = 0
-    ipv = 0
-
-    siv_frontsum = 0
-    fa_incrfrac = 0
-
-    #-----------------------------------------------------------------------------
-    #check if the flood is increasing in the sw cell
-    if gl.sv_end > gl.sv_beg:
-        sv_isincr = 1
-    else:
-        sv_isincr = 0
-    #-----------------------------------------------------------------------------
-    # calculate status of gwcells flooding
-    fa_frac=[1]*gl.nofgwcells
-    
-    for gwcell in range(gl.nofgwcells):
-        fa_cumprev = fa_cum
-        fa_cum = fa_cum + gl.fa[scell]
-        
-        if fa_cum < gl.sa_end or fa_cum==gl.sa_end:
-            fa_frac[gwcell] = 1
-        elif fa_cum > gl.sa_end and fa_cumprev < gl.sa_end:
-            fa_frac[gwcell] = (gl.sa_end - (fa_cumprev)) / gl.fa[scell]
-            if gl.sa_beg > fa_cumprev and gl.sa_end > gl.sa_beg:
-                 fa_incrfrac = (gl.sa_end - gl.sa_beg) / (fa_cum - gl.sa_beg)
-            else:
-                fa_incrfrac = fa_frac[gwcell]
-        else:
-            fa_frac[gwcell] = 0
-        gl.fa_frac_avg[gwcell] = (fa_frac[gwcell] + gl.fa_frac_start[scell, gwcell]) / 2
-
-    #*****************************************************************************
-    #calculate groundwater flow between floodplains and islands
-    for gwcell in range(gl.nofgwcells):
-       #-----------------------------------------------------------------------------
-       # if the gw cell is not flooded
-        if fa_frac[gwcell]== 0:
-            gl.fv_beg = gl.fv_start[scell][gwcell]
-            siv_front = 0
-            gl.f_isfloodflag = 0
-
-            iteration_1(scell,gwcell,ts)
-
-            siv_adv = 0 #fa_frac(gwcell) * gl.fq
-            # fv_end = fv_end + siv_adv
-        #-----------------------------------------------------------------------------
-        # if the gw cell is partly flooded
-        elif fa_frac[gwcell] > 0 and fa_frac[gwcell] < 1:
-            if sv_isincr==1:
-               siv_front = ((gl.idet * gl.fpor * gl.fa[scell]) - gl.fv_start[scell][gwcell]) * fa_incrfrac
-            else:
-                siv_front = 0
-        
-            gl.fv_beg = gl.fv_start[scell][gwcell] + siv_front
-            gl.f_isfloodflag = 0
-        
-            iteration_1(scell, gwcell,ts)
-        
-            siv_adv = fa_frac[gwcell] * gl.fq
-            #gl.fv_end = gl.fv_end + siv_adv    
-        #-----------------------------------------------------------------------------
-        # if the gw cell is entirely flooded
-        else:
-            gl.fv_max = gl.idet * gl.fpor * gl.fa[scell]    
-            siv_front = gl.fv_max - gl.fv_start[scell][gwcell]
-            gl.fv_beg = gl.fv_max
-            gl.fv_end = gl.fv_max
-            gl.f_isfloodflag = 1
-            gl.fev = 0
-        
-            gl.fpv = ((gl.statratio[scell] * gl.p1[ts][0] + (1 - gl.statratio[scell]) * gl.p1[ts][1]) / 1000 * gl.fa[scell]) * (1 - gl.fa_frac_avg[gwcell])
-   
-            iteration_2(scell, gwcell, ts)
-        
-            siv_adv = gl.fq
+def write_init(output_file, _ts):
+    global glnofswcells, glfin_sv, glfin_fv, glfin_iv
+    with open(output_file, "w") as outf:
+        for scell in range(glnofswcells):
+            outf.write("s_"+str(scell)+","+str(int(glfin_sv[scell,_ts]))+"\n")
+        for scell in range(glnofswcells):
+            line="f_"+str(scell)+","+",".join([str(np.round(x,2)) for x in glfin_fv[scell,:,_ts].tolist()])
+            outf.write(line+"\n")
+        for scell in range(glnofswcells):
+            line="i_"+str(scell)+","+",".join([str(np.round(x,2)) for x in glfin_iv[scell,:,_ts].tolist()])
+            outf.write(line+"\n")
             
-        #-----------------------------------------------------------------------------
-        #sets initial values for the next time step
+
+def wbalance_calc():
+    global glsq_in, glfin_spre, glfin_sqout, glfin_sev, glfin_sinf, glfin_sv, glsv_init, glfin_fv, glfv_init 
+    global glfin_fev, glfin_finf, glfin_fgwout,glfin_fpre, glfin_iv, gliv_init, glfin_ipre, glfin_iev
+    #surface reservoir
+    sinflow=glfin_sqin.sum(0)
+    srainfall=glfin_spre.sum(0)
+    soutflow=glfin_sqout.sum(0)
+    sevap=glfin_sev.sum(0)
+    sinfiltration=glfin_sinf.sum(0)
+    svdelta=glfin_sv[-1,:]-glsv_init
+    sinputs=sinflow+srainfall
+    soutputs=soutflow+sevap+sinfiltration
+    swbal=sinputs-soutputs-svdelta
+#    swbalclosure=wbalmerge(swbal)/wbalmerge(svdelta)*100
+    swbalclosure=swbal/sinputs*100
     
-        gl.fv_finish[gwcell] = gl.fv_end
-        gl.iv_finish[scell][gwcell] = gl.iv_end
-        gl.fa_frac_finish[scell][gwcell] = fa_frac[gwcell]
+    #floodplain reservoir
+    fvdelta=(glfin_fv[-1,:,:]-glfv_init).sum(1)
+    fevap=glfin_fev.sum((0,2))
+    finfiltration=glfin_finf.sum((0,2))
+    fgwoutflow=glfin_fgwout.sum((0,2)) 
+    frainfall=glfin_fpre.sum((0,2))
+    finputs=finfiltration+frainfall
+    foutputs=fgwoutflow+fevap
+    print finputs.shape, foutputs.shape, fvdelta.shape
+    fwbal=finputs-foutputs-fvdelta
+    fwbalclosure=fwbal/finputs*100
+#    print fvdelta, fevap, frainfall,finfiltration,fgwoutflow
     
+    #island reservoir
+    ivdelta=(glfin_iv[-1,:,:]-gliv_init).sum(1)
+    ievap=glfin_iev.sum((0,2))
+    irainfall=glfin_ipre.sum((0,2))
+    iinputs=fgwoutflow+irainfall
+    ioutputs=ievap
+    iwbal=iinputs-ioutputs-ivdelta
+    iwbalclosure=iwbal/iinputs*100
+
+    return swbalclosure[np.where(glfinalsumflag==1)[0]], fwbalclosure[np.where(glfinalsumflag==1)[0]], iwbalclosure[np.where(glfinalsumflag==1)[0]]
     
-        #-----------------------------------------------------------------------------
-        #calculates composite fluxes
-#        siv_advsum = siv_advsum + siv_adv
-        siv_frontsum = siv_frontsum + siv_front             # sw cell infiltration
-        gl.siv = siv_front + siv_adv
-        gl.siv_unit = gl.siv_unit + gl.siv              #sw cell infiltration
-        fev_sum = fev_sum + gl.fev
-        iev_sum = iev_sum + gl.iev
-        fv_sum = fv_sum + gl.fv_end
-        iv_sum = iv_sum + gl.iv_end
-        fq_sum = fq_sum + gl.fq
-        fpv_sum = fpv_sum + gl.fpv
-        ipv_sum = ipv_sum + ipv
-    gl.fin_iev_end[scell][ts]=iev_sum
-    gl.fin_fev_end[scell][ts]=fev_sum
+def timer():
+    global t0
+    _t=timeit.default_timer()
+    print _t-t0
+    t0=timeit.default_timer()
 
 
-
-
-
-
-def iteration_1(scell, gwcell, ts):
-    # this calculates the floodplain groundwater reservoir
-    #**********************************************************************************
-    #prepare data
-    gl.fv_end = gl.fv_beg       #initial guess of end floodplain groundwater volume
-    iv_beg = gl.iv_start[scell, gwcell]
-    gl.iv_end = iv_beg       #initial guess of end island groundwater volume
-    fiter_endflag = 0
-    fitern = 0
-    fv_endmin = 0
-    fv_endmax = ""
-
-    #**********************************************************************************
-    #outer iteration start
-    while fiter_endflag==0:
-        gl.fv_av = (gl.fv_end + gl.fv_beg) / 2
-        if gl.fv_av > ((gl.idet - gl.fdet) * gl.fa[scell] * gl.fpor):
-            temp = ((gl.fv_av - ((gl.idet - gl.fdet) * gl.fa[scell] * gl.fpor)) / (gl.fdet * gl.fa[scell] * gl.fpor)) * (1 - gl.fa_frac_avg[gwcell])
-            if temp > 1:
-                temp = 1
-            gl.fev = (gl.evap[ts] / 1000 * gl.fa[scell] * temp)
-            gl.fpv = ((gl.statratio[scell] * gl.p1[ts][0] + (1 - gl.statratio[scell]) * gl.p1[ts][1]) / 1000 * gl.fa[scell]) * (1 - gl.fa_frac_avg[gwcell])
-        else:
-            gl.fev = 0
-    
-        gl.f_isfloodflag = 0
-        iteration_2(scell,gwcell, ts)
-        fv_endc = gl.fv_beg + gl.fpv - gl.fq - gl.fev
-        #-----------------------------------------------------------------------------
-        #check if outer iteration convergence is achieved
-        if abs(fv_endc - gl.fv_end) < (gl.convcrit * gl.fv_end):
-            fiter_endflag = 1
-        elif gl.fv_end < 0.001:
-            fiter_endflag = 1
-        else:
-            if gl.fv_end > fv_endc:
-                fv_endmax = gl.fv_end
-            else:
-                fv_endmin = gl.fv_end
-
-            #----------------------------------------------------
-            #KKKKKKKKKKKKKKKKKKKKK
-            if fv_endmax=="":
-                gl.fv_end = fv_endc
-            else:
-                gl.fv_end = fv_endmin + 0.5 * (fv_endmax - fv_endmin)
-    #-----------------------------------------------------------------------------
-    #advance the iteration
-        fitern = fitern + 1
-        if fitern > gl.maxiter:
-            print (str(gl.maxiter) + " f iterations in scell " + str(scell) + ", gwcell"+str(gwcell)+" in " + gl.recdate[ts])
-            fiter_endflag=1
-
-
-
-
-
-def iteration_2(scell,gwcell,ts):
-    # this calculates the island groundwater reservoir
-    #*********************************************************************************
-    #prepare data
-    i_itern = 0
-    i_iter_endflag = 0
-    iv_endmin = 0
-    iv_endmax = ""
-    #-----------------------------------------------------------------------------
-    #initial guess of end island volume
-    iv_beg = gl.iv_start[scell, gwcell]
-    gl.iv_end = iv_beg
-    #**********************************************************************************
-    #inner iteration start
-
-    while i_iter_endflag==0: 
-        iv_av = (gl.iv_end + iv_beg) / 2
-        if gl.f_isfloodflag==1:
-            gl.fq = ((gl.fv_max / (gl.fa[scell] * gl.fpor)) - (iv_av / ((gl.ia[scell]) * gl.ipor))) * gl.kgw[scell]
-        else:
-            gl.fq = ((gl.fv_av / (gl.fa[scell] * gl.fpor)) - (iv_av / ((gl.ia[scell]) * gl.ipor))) * gl.kgw[scell]            
-
-        evapi = iv_av / (gl.ipor * gl.idet * gl.ia[scell])    
-        if evapi > 0.6:
-            evapi = 0.6
-        gl.iev = gl.evap[ts] * (gl.ia[scell]) / 1000 * evapi
-        ipv = ((gl.statratio[scell] * gl.p1[ts][0] + (1 - gl.statratio[scell]) * gl.p1[ts][1]) / 1000 * (gl.ia[scell]))
-        iv_endc = iv_beg + gl.fq - gl.iev + ipv
-    
-        #-----------------------------------------------------------------------------
-        #check if inner iteration convergence is achieved
-        if abs(iv_endc - gl.iv_end) < gl.convcrit * gl.iv_end:
-            i_iter_endflag = 1
-        elif gl.iv_end < gl.convcrit:
-            i_iter_endflag = 1
-        else:
-            if gl.iv_end > iv_endc:
-                iv_endmax = gl.iv_end
-            else:
-                iv_endmin = gl.iv_end
-
-            if iv_endmax=="":
-                gl.iv_end = iv_endc
-            else:
-                gl.iv_end = iv_endmin + 0.5 * (iv_endmax - iv_endmin)
-
-        #-----------------------------------------------------------------------------
-        #advance the iteration
-        i_itern = i_itern + 1
 
 def eco_calc():
     print("calculating eco model... ")
@@ -924,14 +533,36 @@ def inund_calc(outputfile):
 
 
 
+print "parameters",file_modpar
+print "initialization", file_init
+print "input",file_input
+print "spinup", spinup
+print "output", outputfiles
 
+#t0 = timeit.default_timer()
 
 read_modset(file_modset)                                #reading model configuration
+read_modpar(file_modpar)                                #reading model parameters
 read_input(file_input)                                  #reading inputs
 read_init(file_init)                                    #reading initial conditions
-read_modpar(file_modpar)                                #reading model parameters
 
-model_calc()                                            #this is when the model is actually run
+
+
+
+result=hcy.model_calc(glinflow, glprec, glpet, glsv_init, glfv_init, gliv_init, glunitpar, glgwpar)                                            #this is when the model is actually run
+
+glfin_sqin, glfin_sa, glfin_sv, glfin_sev, glfin_spre, glfin_sqout,glfin_sinf,\
+glfin_fv, glfin_fev,glfin_fpre,glfin_fgwout,glfin_finf,\
+glfin_iv, glfin_iev,glfin_ipre=result
+
+
+
+glout_sa=mergecells(glfin_sa)
+glout_sv=mergecells(glfin_sv)
+glout_sqout=mergecells(glfin_sqout)
+glout_sev=mergecells(glfin_sev)
+glout_sinf=mergecells(glfin_sinf)
+
 
 for outputfile in outputfiles:
     if "allinundation" in outputfile:
@@ -949,3 +580,5 @@ for outputfile in outputfiles:
 
 print("success")
  
+
+
